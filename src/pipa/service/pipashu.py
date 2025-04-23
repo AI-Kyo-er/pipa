@@ -53,6 +53,7 @@ class PIPAShuData:
         run_time: int = None,
         dev: str | None = None,
         freq_MHz: int = None,
+        ef_cores: bool = False,
     ):
         """
         Get the performance statistics metrics.
@@ -63,10 +64,18 @@ class PIPAShuData:
             run_time (int): The run time.
             dev (str): The device name.
             freq_MHz (int): The CPU frequency in MHz.
+            ef_cores (bool): If True, extract core event from cpu_core/event/ or cpu_atom/event/ format.
 
         Returns:
             dict: The performance statistics metrics.
         """
+        from pipa.common.logger import logger
+        import pandas as pd
+        
+        # Pass ef_cores parameter to perf_stat_data
+        if ef_cores:
+            self.perf_stat_data.use_ef_cores = True
+        
         run_time = self.perf_stat_data.get_time_total() if not run_time else run_time
 
         cycles = self.perf_stat_data.get_cycles_by_thread(threads)
@@ -77,7 +86,13 @@ class PIPAShuData:
         )
         path_length = self.perf_stat_data.get_pathlength(num_transactions, threads)
         CPI = self.perf_stat_data.get_CPI_by_thread(threads)
-        cycles_per_requests = cycles / num_transactions
+        
+        # Check if cycles is NaN before performing calculations
+        if pd.isna(cycles):
+            logger.warning("Cycles value is NaN. Setting cycles_per_requests to NaN.")
+            cycles_per_requests = float('nan')
+        else:
+            cycles_per_requests = cycles / num_transactions
 
         perf_stat_metrics = {
             "transactions": num_transactions,

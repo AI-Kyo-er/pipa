@@ -1,5 +1,5 @@
 import questionary
-from pipa.common.hardware.cpu import get_cpu_cores
+from pipa.common.hardware.cpu import get_cpu_cores, get_cpu_core_types
 from rich import print
 from io import TextIOWrapper
 from datetime import datetime
@@ -32,6 +32,33 @@ def ask_number(question: str, default: int) -> int:
 
 
 CORES_ALL = get_cpu_cores()
+CPU_CORE_TYPES = get_cpu_core_types()
+
+# Format core ranges as strings for command-line use
+P_CORES_RANGE = f"{CPU_CORE_TYPES['p_cores'][0]}-{CPU_CORE_TYPES['p_cores'][-1]}" if CPU_CORE_TYPES['p_cores'] else ""
+E_CORES_RANGE = f"{CPU_CORE_TYPES['e_cores'][0]}-{CPU_CORE_TYPES['e_cores'][-1]}" if CPU_CORE_TYPES['e_cores'] else ""
+
+# This flag is no longer automatically determined, but will be set from command line arguments
+HAS_HYBRID_CORES = False
+
+def get_core_type_range_string(core_type="all"):
+    """
+    Returns a range string for the specified core type.
+    
+    Args:
+        core_type (str): One of 'all', 'p_cores', or 'e_cores'
+    
+    Returns:
+        str: A range string like "0-11" for the specified core type
+    """
+    if core_type == "all":
+        return f"{CORES_ALL[0]}-{CORES_ALL[-1]}"
+    elif core_type == "p_cores" and CPU_CORE_TYPES['p_cores']:
+        return f"{CPU_CORE_TYPES['p_cores'][0]}-{CPU_CORE_TYPES['p_cores'][-1]}"
+    elif core_type == "e_cores" and CPU_CORE_TYPES['e_cores']:
+        return f"{CPU_CORE_TYPES['e_cores'][0]}-{CPU_CORE_TYPES['e_cores'][-1]}"
+    else:
+        return f"{CORES_ALL[0]}-{CORES_ALL[-1]}"
 
 
 def quest_basic():

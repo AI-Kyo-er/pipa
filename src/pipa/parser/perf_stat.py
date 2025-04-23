@@ -7,12 +7,33 @@ from pipa.parser import make_single_plot
 from typing import List, Optional
 import seaborn as sns
 import plotly.graph_objects as go
+import re
 
 
 class PerfStatData:
     def __init__(self, perf_stat_csv_path: str):
         self.data = self.parse_perf_stat_file(perf_stat_csv_path)
         self._df_wider = None
+        self.use_ef_cores = False
+        
+    def _extract_core_event(self, event_name: str) -> str:
+        """
+        Extract the core event from a cpu_core/event/ or cpu_atom/event/ format.
+        
+        Args:
+            event_name (str): The event name to process.
+            
+        Returns:
+            str: The extracted event name or the original if no match.
+        """
+        if not self.use_ef_cores:
+            return event_name
+            
+        # Use regex to extract the event part from cpu_xxx/event/ format
+        match = re.match(r'cpu_\w+/([^/]+)/', event_name)
+        if match:
+            return match.group(1)
+        return event_name
 
     def get_CPI(self):
         """
@@ -21,16 +42,48 @@ class PerfStatData:
         Returns:
             pd.DataFrame: Dataframe containing the CPI data.
         """
-        return (
-            self.data[self.data["metric_type"] == "cycles"]
-            .merge(
-                self.data[self.data["metric_type"] == "instructions"],
-                on=["timestamp", "cpu_id"],
-                suffixes=("_cycles", "_instructions"),
-            )
-            .assign(CPI=lambda x: x["value_cycles"] / x["value_instructions"])
-            .drop(columns=["metric_type_cycles", "metric_type_instructions"])
+        # Define event names based on whether use_ef_cores is enabled
+        cycles_event = "cycles"
+        instructions_event = "instructions"
+        
+        if self.use_ef_cores:
+            # Get all metric types and filter for the ones that match cycles or instructions
+            all_metrics = self.data["metric_type"].unique()
+            cycles_metrics = [m for m in all_metrics if self._extract_core_event(m) == "cycles"]
+            instructions_metrics = [m for m in all_metrics if self._extract_core_event(m) == "instructions"]
+            
+            # Get cycles data from all matching events and drop rows with NaN values
+            cycles_df = self.data[self.data["metric_type"].isin(cycles_metrics)].dropna(subset=["value"])
+            # Add a new column with the extracted event name
+            cycles_df["core_event"] = cycles_df["metric_type"].apply(self._extract_core_event)
+            
+            # Get instructions data from all matching events and drop rows with NaN values
+            instructions_df = self.data[self.data["metric_type"].isin(instructions_metrics)].dropna(subset=["value"])
+            # Add a new column with the extracted event name
+            instructions_df["core_event"] = instructions_df["metric_type"].apply(self._extract_core_event)
+        else:
+            # Get cycles data and drop rows with NaN values
+            cycles_df = self.data[self.data["metric_type"] == cycles_event].dropna(subset=["value"])
+            cycles_df["core_event"] = cycles_event
+            
+            # Get instructions data and drop rows with NaN values
+            instructions_df = self.data[self.data["metric_type"] == instructions_event].dropna(subset=["value"])
+            instructions_df["core_event"] = instructions_event
+        
+        # Merge the dataframes
+        merged_df = cycles_df.merge(
+            instructions_df,
+            on=["timestamp", "cpu_id", "core_event"],
+            suffixes=("_cycles", "_instructions"),
+            how="inner"  # Only keep rows where both cycles and instructions are available
         )
+        
+        # Calculate CPI only for valid rows (avoid division by zero)
+        valid_mask = merged_df["value_instructions"] > 0
+        merged_df["CPI"] = float('nan')  # Initialize with NaN
+        merged_df.loc[valid_mask, "CPI"] = merged_df.loc[valid_mask, "value_cycles"] / merged_df.loc[valid_mask, "value_instructions"]
+        
+        return merged_df.drop(columns=["metric_type_cycles", "metric_type_instructions"])
 
     def get_CPI_time(self, threads: list | None = None):
         """
@@ -64,6 +117,9 @@ class PerfStatData:
         """
 
         df = self.get_CPI()
+        # Drop rows with NaN values in either cycles or instructions
+        df = df.dropna(subset=["value_cycles", "value_instructions"])
+        
         match data_type:
             case "thread":
                 data_per_thread = (
@@ -71,15 +127,22 @@ class PerfStatData:
                     .groupby("cpu_id")
                     .sum()
                 )
-                data_per_thread["CPI"] = (
-                    data_per_thread["value_cycles"]
-                    / data_per_thread["value_instructions"]
+                # Avoid division by zero or NaN
+                valid_mask = (data_per_thread["value_instructions"] > 0) & (data_per_thread["value_cycles"].notna())
+                data_per_thread["CPI"] = float('nan')  # Initialize with NaN
+                data_per_thread.loc[valid_mask, "CPI"] = (
+                    data_per_thread.loc[valid_mask, "value_cycles"]
+                    / data_per_thread.loc[valid_mask, "value_instructions"]
                 )
                 return data_per_thread
             case "system":
                 total_instructions = df["value_instructions"].sum()
                 total_cycles = df["value_cycles"].sum()
-                return total_cycles / total_instructions
+                if total_instructions > 0:
+                    return total_cycles / total_instructions
+                else:
+                    logger.warning("Total instructions is zero or NaN, cannot calculate system CPI")
+                    return float('nan')
             case _:
                 raise ValueError("Invalid data type")
 
@@ -94,9 +157,22 @@ class PerfStatData:
             float: The weighted CPI value for the specified threads.
         """
         df = self.get_CPI_overall("thread")
-        cycles_sum = df["value_cycles"].sum()
-        instructions_sum = df["value_instructions"].sum()
-        return cycles_sum / instructions_sum
+        # Check if all threads exist in the dataframe
+        avail_threads = [t for t in threads if t in df.index]
+        if len(avail_threads) < len(threads):
+            missing = set(threads) - set(avail_threads)
+            logger.warning(f"Some threads {missing} are not found in the data for CPI calculation")
+        
+        # Use only available threads with valid data
+        df_subset = df.loc[avail_threads]
+        cycles_sum = df_subset["value_cycles"].dropna().sum()
+        instructions_sum = df_subset["value_instructions"].dropna().sum()
+        
+        if instructions_sum > 0:
+            return cycles_sum / instructions_sum
+        else:
+            logger.warning("Total instructions for the specified threads is zero or NaN, cannot calculate CPI")
+            return float('nan')
 
     def get_CPI_average_by_thread(self, threads: list):
         """
@@ -164,7 +240,25 @@ class PerfStatData:
         Raises:
         - ValueError: If an invalid data type is provided.
         """
-        df = self.data[self.data["metric_type"] == events]
+        # If using ef_cores, need to match event names differently
+        if self.use_ef_cores:
+            # Get all metric types
+            all_metrics = self.data["metric_type"].unique()
+            # Filter metrics that match the desired event after extraction
+            matching_metrics = [m for m in all_metrics if self._extract_core_event(m) == events]
+            if not matching_metrics:
+                logger.warning(f"No metrics found matching '{events}' after extraction")
+                # Return empty dataframe or 0 based on data_type
+                if data_type == "thread":
+                    return pd.DataFrame(columns=["cpu_id", "value"]).set_index("cpu_id")
+                else:
+                    return 0
+            
+            # Get data for all matching metrics
+            df = self.data[self.data["metric_type"].isin(matching_metrics)]
+        else:
+            df = self.data[self.data["metric_type"] == events]
+            
         match data_type:
             case "thread":
                 return df[["cpu_id", "value"]].groupby("cpu_id").sum()
@@ -216,8 +310,18 @@ class PerfStatData:
             pd.DataFrame: A DataFrame containing the total cycles per thread.
         """
         if threads is None:
-            return self.get_cycles_overall("thread")["value"].sum()
-        return self.get_cycles_overall("thread").loc[threads]["value"].sum()
+            # Use dropna to ignore NaN values
+            return self.get_cycles_overall("thread")["value"].dropna().sum()
+        
+        df = self.get_cycles_overall("thread")
+        # Check if all threads exist in the dataframe
+        avail_threads = [t for t in threads if t in df.index]
+        if len(avail_threads) < len(threads):
+            missing = set(threads) - set(avail_threads)
+            logger.warning(f"Some threads {missing} are not found in the data")
+        
+        # Use dropna to ignore NaN values
+        return df.loc[avail_threads]["value"].dropna().sum()
 
     def get_instructions_by_thread(self, threads=None):
         """
@@ -230,8 +334,33 @@ class PerfStatData:
             int: The total instructions in all threads used.
         """
         if threads is None:
-            return self.get_instructions_overall("system")
-        return self.get_instructions_overall("thread").loc[threads]["value"].sum()
+            # Use dropna to ignore NaN values for system-wide calculation
+            if self.use_ef_cores:
+                # If using ef_cores, need to match event names differently
+                all_metrics = self.data["metric_type"].unique()
+                # Filter metrics that match instructions after extraction
+                matching_metrics = [m for m in all_metrics if self._extract_core_event(m) == "instructions"]
+                if not matching_metrics:
+                    logger.warning("No metrics found matching 'instructions' after extraction")
+                    return float('nan')
+                
+                # Get data for all matching metrics
+                df = self.data[self.data["metric_type"].isin(matching_metrics)]
+            else:
+                df = self.data[self.data["metric_type"] == "instructions"]
+            
+            return df["value"].dropna().sum()
+            
+        # For specific threads
+        df = self.get_instructions_overall("thread")
+        # Check if all threads exist in the dataframe
+        avail_threads = [t for t in threads if t in df.index]
+        if len(avail_threads) < len(threads):
+            missing = set(threads) - set(avail_threads)
+            logger.warning(f"Some threads {missing} are not found in the data")
+            
+        # Use dropna to ignore NaN values
+        return df.loc[avail_threads]["value"].dropna().sum()
 
     def get_pathlength(self, num_transcations: int, threads: list):
         """
@@ -250,29 +379,39 @@ class PerfStatData:
 
     def get_cycles_per_second(self, seconds: int = 120, threads=None):
         """
-        Returns the total cycles per second.
+        Returns the cycles per second.
 
         Args:
-            seconds (int): The number of seconds. Default is 120.
-            threads (list): A list of thread IDs. Default is None.
+            seconds (int): The number of seconds.
+            threads (list): A list of thread IDs.
 
         Returns:
-            int: The total cycles per second.
+            float: The cycles per second value.
         """
-        return self.get_cycles_by_thread(threads) / seconds
+        cycles = self.get_cycles_by_thread(threads)
+        # Check if cycles is valid (not NaN)
+        if pd.isna(cycles):
+            logger.warning("Cycles value is NaN, cannot calculate cycles per second")
+            return float('nan')
+        return cycles / seconds
 
     def get_instructions_per_second(self, seconds: int = 120, threads=None):
         """
-        Returns the total instructions per second.
+        Returns the instructions per second.
 
         Args:
-            seconds (int): The number of seconds. Default is 120.
-            threads (list): A list of thread IDs. Default is None.
+            seconds (int): The number of seconds.
+            threads (list): A list of thread IDs.
 
         Returns:
-            int: The total instructions per second.
+            float: The instructions per second value.
         """
-        return self.get_instructions_by_thread(threads) / seconds
+        instructions = self.get_instructions_by_thread(threads)
+        # Check if instructions is valid (not NaN)
+        if pd.isna(instructions):
+            logger.warning("Instructions value is NaN, cannot calculate instructions per second")
+            return float('nan')
+        return instructions / seconds
 
     def get_time_range(self):
         """
@@ -320,13 +459,27 @@ class PerfStatData:
         """
         if self._df_wider is not None:
             return self._df_wider
+            
         df = self.data[["timestamp", "cpu_id", "value", "metric_type"]]
-        df_wider = df.pivot_table(
-            index=["timestamp", "cpu_id"],
-            columns="metric_type",
-            values="value",
-            aggfunc="first",
-        ).reset_index()
+        
+        # Apply event name extraction for ef_cores mode
+        if self.use_ef_cores:
+            # Create a new column with extracted event names for pivot
+            df["core_event"] = df["metric_type"].apply(self._extract_core_event)
+            df_wider = df.pivot_table(
+                index=["timestamp", "cpu_id"],
+                columns="core_event",
+                values="value",
+                aggfunc="first",
+            ).reset_index()
+        else:
+            df_wider = df.pivot_table(
+                index=["timestamp", "cpu_id"],
+                columns="metric_type",
+                values="value",
+                aggfunc="first",
+            ).reset_index()
+            
         df_wider.columns = [f"{col}" for col in df_wider.columns]
         self._df_wider = df_wider
         return df_wider
@@ -380,65 +533,52 @@ class PerfStatData:
         -   optional unit of metric
         """
         pandarallel.initialize(min(12, NUM_CORES_PHYSICAL))
-        try:
-            df = pd.read_csv(
-                stat_output_path,
-                skiprows=1,
-                names=[
-                    "timestamp",
-                    "cpu_id",
-                    "value",
-                    "unit",
-                    "metric_type",
-                    "run_time(ns)",
-                    "run_percentage",
-                    "opt_value",
-                    "opt_unit_metric",
-                ],
-            ).astype(
-                {
-                    "timestamp": "float64",
-                    "cpu_id": str,
-                    "value": "int64",
-                    "unit": str,
-                    "metric_type": str,
-                    "run_time(ns)": "int64",
-                    "run_percentage": "float64",
-                    "opt_value": "float64",
-                    "opt_unit_metric": str,
-                }
-            )
-            df["cpu_id"] = df["cpu_id"].str.removeprefix("CPU").astype(int)
-        except pd.errors.IntCastingNaNError as e:
-            logger.warning(
-                f"Detect perf stat {stat_output_path} not in no aggregation mode(-A), will use use -1 as cpuid for all"
-            )
-            df = pd.read_csv(
-                stat_output_path,
-                skiprows=1,
-                names=[
-                    "timestamp",
-                    "value",
-                    "unit",
-                    "metric_type",
-                    "run_time(ns)",
-                    "run_percentage",
-                    "opt_value",
-                    "opt_unit_metric",
-                ],
-            ).astype(
-                {
-                    "timestamp": "float64",
-                    "value": "int64",
-                    "unit": str,
-                    "metric_type": str,
-                    "run_time(ns)": "int64",
-                    "run_percentage": "float64",
-                    "opt_value": "float64",
-                    "opt_unit_metric": str,
-                }
-            )
-            df["cpu_id"] = -1
+        
+        # First read the CSV with value as string to handle '<not supported>'
+        df = pd.read_csv(
+            stat_output_path,
+            skiprows=1,
+            names=[
+                "timestamp",
+                "cpu_id",
+                "value",
+                "unit",
+                "metric_type",
+                "run_time(ns)",
+                "run_percentage",
+                "opt_value",
+                "opt_unit_metric",
+            ],
+        )
+        
+        # Process the CPU ID
+        df["cpu_id"] = df["cpu_id"].str.removeprefix("CPU").astype(int)
+        
+        # Handle '<not supported>' values in the 'value' column
+        mask = df["value"] == "<not supported>"
+        if mask.any():
+            logger.warning(f"Found {mask.sum()} '<not supported>' values in {stat_output_path}, will set them to NaN")
+            df.loc[mask, "value"] = float('nan')
+            
+        # Handle '<not counted>' values in the 'value' column
+        mask_not_counted = df["value"] == "<not counted>"
+        if mask_not_counted.any():
+            logger.warning(f"Found {mask_not_counted.sum()} '<not counted>' values in {stat_output_path}, will set them to NaN")
+            df.loc[mask_not_counted, "value"] = float('nan')
+        
+        # Convert columns to appropriate types
+        df = df.astype(
+            {
+                "timestamp": "float64",
+                "value": "float64",  # Use float64 instead of int64 to handle NaN
+                "unit": str,
+                "metric_type": str,
+                "run_time(ns)": "int64",
+                "run_percentage": "float64",
+                "opt_value": "float64",
+                "opt_unit_metric": str,
+            }
+        )
         return df
 
     def get_available_events(self) -> List[str]:
@@ -447,10 +587,15 @@ class PerfStatData:
         Returns:
             List[str]: list of avaiable events.
         """
-        df = self.get_wider_data()
-        col = df.columns.copy()
-        col = col.drop(["timestamp", "cpu_id"])
-        return col.to_list()
+        if self.use_ef_cores:
+            # Return extracted event names
+            all_metrics = self.data["metric_type"].unique()
+            return list(set([self._extract_core_event(m) for m in all_metrics]))
+        else:
+            df = self.get_wider_data()
+            col = df.columns.copy()
+            col = col.drop(["timestamp", "cpu_id"])
+            return col.to_list()
 
     def plot_interactive_event(
         self,

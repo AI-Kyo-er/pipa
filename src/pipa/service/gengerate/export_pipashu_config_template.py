@@ -27,6 +27,9 @@ events_stat: # The events to be used in perf-stat.
         - L1-icache-load-misses
 # No need to set if use_emon is True.
 
+hybrid_cores: False # Whether to use separate events for P-cores and E-cores.
+# When set to True, events for P-cores will be prefixed with 'cpu_core/' and events for E-cores with 'cpu_atom/'.
+
 MPP_HOME: /mnt/hdd/share/emon/system_health_monitor # The path to the mpp.
 # No need to set if use_emon is False.
 

@@ -7,6 +7,9 @@ from pipa.service.gengerate.common import (
     opener,
     parse_perf_data,
     move_old_file,
+    CPU_CORE_TYPES,
+    HAS_HYBRID_CORES,
+    get_core_type_range_string,
 )
 from pipa.service.export_sys_config import write_export_config_script
 import os
@@ -43,6 +46,15 @@ def quest():
             "How long do you want to run perf-stat? (Default: 120s)\n", "120"
         ).ask()
 
+    # Add question for hybrid cores mode
+    hybrid_cores = questionary.select(
+        "Use hybrid cores mode (separate events for P-cores and E-cores)?\n", 
+        choices=["Yes", "No"], 
+        default="No"
+    ).ask()
+    
+    config["hybrid_cores"] = hybrid_cores == "Yes"
+    
     config["duration_record"] = duration_record
     config["duration_stat"] = duration_stat
 
@@ -54,29 +66,24 @@ def generate(config: dict):
     Generate shell scripts for collecting and parsing performance data.
 
     Args:
-        config (dict): Configuration dictionary containing the following keys:
-            - workspace (str): Path to the workspace directory.
-            - freq_record (str): Frequency of recording events.
-            - events_record (str): Events to be recorded.
-            - annotete (bool): Flag indicating whether to annotate the performance data.
-            - duration_record (int): Duration of recording events.
-            - stat_time (int): Duration of statistical analysis.
-            - events_stat (str): Events for statistical analysis.
-            - count_delta_stat (int): Count delta for statistical analysis.
-            - use_emon (bool): Flag indicating whether to use emon for analysis.
-            - MPP_HOME (str): Path to the MPP_HOME directory (required if use_emon is True).
+        config (dict): A dictionary containing configuration parameters.
 
     Returns:
         None
     """
-
     workspace = config["workspace"]
     freq_record = config["freq_record"]
     events_record = config["events_record"]
-    annotete = config["annotete"]
-    duration_record = config["duration_record"]
-    stat_time = config["duration_stat"]
-    use_emon = config["use_emon"]
+    stat_time = config.get("duration_stat", 120)
+    duration_record = config.get("duration_record", 120)
+    if duration_record == -1:
+        duration_record = None
+    if stat_time == -1:
+        stat_time = None
+    annotete = config.get("annotete", False)
+    use_emon = config.get("use_emon", False)
+    # Use the hybrid_cores parameter from config instead of the global variable
+    hybrid_cores = config.get("hybrid_cores", False)
 
     if use_emon:
         mpp = config.get("MPP_HOME", config.get("mpp", None))
@@ -110,10 +117,38 @@ def generate(config: dict):
                 + (f"-w sleep {stat_time}\n" if stat_time else "\n")
             )
         else:
-            f.write(
-                f"perf stat -e {events_stat} -C {CORES_ALL[0]}-{CORES_ALL[-1]} -A -x , -I {count_delta_stat} -o $WORKSPACE/perf-stat.csv"
-                + (f" sleep {stat_time}\n" if stat_time else "\n")
-            )
+            # For hybrid architecture with P-cores and E-cores
+            if hybrid_cores:
+                # Run perf on P-cores
+                p_cores_range = get_core_type_range_string("p_cores")
+                # Prefix each event with cpu_core/ for P-cores
+                p_core_events = ",".join([f"cpu_core/{event}/" for event in events_stat.split(",")])
+                f.write(
+                    f"perf stat -e {p_core_events} -C {p_cores_range} -A -x , -I {count_delta_stat} -o $WORKSPACE/perf-stat-pcores.csv"
+                    + (f" sleep {stat_time} &\n" if stat_time else " &\n")
+                )
+                f.write("p_cores_pid=$!\n")
+                
+                # Run perf on E-cores
+                e_cores_range = get_core_type_range_string("e_cores")
+                # Prefix each event with cpu_atom/ for E-cores
+                e_core_events = ",".join([f"cpu_atom/{event}/" for event in events_stat.split(",")])
+                f.write(
+                    f"perf stat -e {e_core_events} -C {e_cores_range} -A -x , -I {count_delta_stat} -o $WORKSPACE/perf-stat-ecores.csv"
+                    + (f" sleep {stat_time}\n" if stat_time else "\n")
+                )
+                
+                # Wait for the P-cores perf to finish
+                f.write("wait $p_cores_pid\n")
+                
+                # Combine the results - skip first two lines of the second file
+                f.write("cat $WORKSPACE/perf-stat-pcores.csv <(tail -n +3 $WORKSPACE/perf-stat-ecores.csv) > $WORKSPACE/perf-stat.csv\n")
+            else:
+                # Use the original approach for homogeneous cores
+                f.write(
+                    f"perf stat -e {events_stat} -C {CORES_ALL[0]}-{CORES_ALL[-1]} -A -x , -I {count_delta_stat} -o $WORKSPACE/perf-stat.csv"
+                    + (f" sleep {stat_time}\n" if stat_time else "\n")
+                )
         f.write("kill -9 $sar_pid\n")
 
         f.write("echo 'Performance data collected successfully.'\n")

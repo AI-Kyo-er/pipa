@@ -54,7 +54,12 @@ def build(path: str):
     """
     config = load_yaml_config(path)
     config["events_stat"] = ",".join(config["events_stat"])
-    build_command(config["use_taskset"], config["core_range"], config["command"])
+    config["command"] = build_command(config.get("use_taskset", False), config.get("core_range", "0-7"), config["command"])
+    
+    # Check if hybrid_cores parameter exists in the config, default to False if not
+    if "hybrid_cores" not in config:
+        config["hybrid_cores"] = False
+    
     if config["run_by_perf"]:
         generate_pipa(config)
     else:
